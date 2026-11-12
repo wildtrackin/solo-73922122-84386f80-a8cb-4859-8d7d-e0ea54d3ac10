@@ -1,0 +1,42 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ocr-accent-archive:latest
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      # Two real API worker processes share one SQLite/WAL database.
+      - --workers
+      - "2"
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      ARCHIVE_DB_PATH: /data/archive.db
+      REBUILD_LEASE_SECONDS: "${REBUILD_LEASE_SECONDS:-20}"
+      REBUILD_BATCH_SIZE: "${REBUILD_BATCH_SIZE:-500}"
+      # Set to e.g. 250 for a visible live-rebuild demonstration.
+      REBUILD_BATCH_DELAY_MS: "${REBUILD_BATCH_DELAY_MS:-0}"
+      DB_BUSY_TIMEOUT_SECONDS: "${DB_BUSY_TIMEOUT_SECONDS:-30}"
+    volumes:
+      - archive-data:/data
+    restart: unless-stopped
+    stop_grace_period: 10s
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)"
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+volumes:
+  archive-data: {}
