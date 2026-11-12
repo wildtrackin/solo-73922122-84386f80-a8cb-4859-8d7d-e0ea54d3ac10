@@ -5,6 +5,10 @@ policy can be changed online. Page corrections and deletes continue to commit
 while a new index is being built; the old index serves searches until the new
 generation has caught up and is switched atomically.
 
+A fixed-rule **duplicate-scan grouping** API (`GET /api/duplicates`) helps QA
+inspectors find pages that look like the same sheet scanned twice, so a human
+can review and clean them up. It never merges or deletes anything by itself.
+
 ## Start with Docker Compose
 
 ```bash
@@ -133,6 +137,76 @@ curl --get "$BASE/api/search" --data-urlencode 'q=resume'
 Deleted `ocr-002` remains absent, and returned titles/bodies are the corrected
 committed versions from the same SQLite snapshot as the hit.
 
+## Duplicate-scan groups (QA)
+
+`GET /api/duplicates` groups pages whose OCR bodies look like repeated scans
+of the same sheet. The rule is **fixed** and does not follow the search
+accent policy (`keep`/`fold` never changes it):
+
+1. the body is normalised with **NFC** and then **casefolded**;
+2. tokens are maximal runs of Unicode alphanumeric characters;
+3. the page signature is the de-duplicated set of adjacent token bigrams;
+4. two **non-empty** bigram sets are linked when the Jaccard similarity
+   `|A ∩ B| / |A ∪ B|` is at least **0.8**.
+
+The response contains the connected groups (at least two pages each), every
+similar pair with its score, and the current revision of each page — all read
+from one committed SQLite snapshot, so revisions and relations always agree.
+Pages are never merged or deleted automatically; cleanup is a human decision
+made after reviewing the groups.
+
+### Demo
+
+```bash
+# A bridge page that connects two otherwise-dissimilar pages.
+curl -sS -X PUT "$BASE/api/pages/page-a" -H 'Content-Type: application/json' \
+  -d '{"title":"A","body":"alpha bravo charlie delta echo foxtrot golf hotel india juliett"}'
+curl -sS -X PUT "$BASE/api/pages/page-b" -H 'Content-Type: application/json' \
+  -d '{"title":"B","body":"bravo charlie delta echo foxtrot golf hotel india juliett kilo"}'
+curl -sS -X PUT "$BASE/api/pages/page-c" -H 'Content-Type: application/json' \
+  -d '{"title":"C","body":"charlie delta echo foxtrot golf hotel india juliett kilo lima"}'
+
+curl -sS "$BASE/api/duplicates"
+# One group [page-a, page-b, page-c]; pairs (a,b) and (b,c) score exactly 0.8,
+# (a,c) is below threshold but connected through the bridge page-b.
+
+curl -sS -X DELETE "$BASE/api/pages/page-b"
+curl -sS "$BASE/api/duplicates"
+# The bridge is gone: no pairs, no groups. page-a and page-c still exist.
+```
+
+Concurrent writers cannot miss links — fire similar writes in parallel and
+every adjacent pair appears:
+
+```bash
+for i in 0 1 2 3 4 5 6 7; do
+  body=""
+  for j in $(seq $i $((i+9))); do body="$body w$(printf %02d $j)"; done
+  curl -sS -X PUT "$BASE/api/pages/scan-$i" -H 'Content-Type: application/json' \
+    -d "{\"title\":\"Scan $i\",\"body\":\"$body\"}" &
+done; wait
+curl -sS "$BASE/api/duplicates"
+```
+
+### How relations stay consistent
+
+* Similarity relations live in two SQLite tables (`page_signatures`,
+  `similar_pairs`) and are written in the **same transaction** as the page
+  body, the change-log entry and the live FTS update. If any step fails, the
+  whole write rolls back and nothing changes.
+* The expensive part — reading all current signatures and computing Jaccard
+  scores — runs in a read-only snapshot **before** the write transaction, so
+  the database write lock is never held while similarity is computed. The
+  write transaction first re-checks the change-log high-water mark; if a
+  concurrent writer (either of the two API processes) committed in between,
+  the write is rolled back and retried against a fresh snapshot. That is why
+  simultaneously added similar pages cannot miss their link.
+* Groups are connected components computed from the stored pairs at query
+  time, so correcting or deleting a bridge page re-splits the groups on the
+  next read.
+* Pages that existed before this feature are backfilled once at startup (and
+  lazily on demand) with the same snapshot-then-swap discipline.
+
 ## Accent examples
 
 | Document word | `keep` query | `fold` query |
@@ -156,6 +230,7 @@ non-Latin combining marks are preserved.
 | `DELETE` | `/api/pages/{page_id}` | Idempotent delete. |
 | `GET` | `/api/pages/{page_id}` | Read a committed page. |
 | `GET` | `/api/search?q=word` | Word search over the active FTS generation. |
+| `GET` | `/api/duplicates` | Connected duplicate-scan groups, similar pairs and current revisions. |
 | `POST` | `/api/index/rebuild` | Queue/switch accent policy through a background rebuild. |
 | `GET` | `/api/index/status` | Active policy/generation, current job, progress, history. |
 | `GET` | `/api/index/jobs/{job_id}` | One rebuild job. |
@@ -202,6 +277,14 @@ schema.
 * **Fencing** — the final activation re-checks the job's claim token and
   active state under the write lock, so a stale worker that resumes cannot
   switch an obsolete generation after a newer job has been claimed.
+* **Duplicate-scan relations** — `page_signatures`/`similar_pairs` are
+  maintained in the same transaction as `pages`, `changes` and the live FTS
+  table. Jaccard scores are computed from a read-only snapshot outside the
+  write lock; the write commits only if the change-log high-water mark is
+  unchanged, otherwise it retries. Groups are derived from the stored pairs
+  at query time, so bridge-page corrections/deletions re-split groups
+  immediately, and one read snapshot keeps returned revisions consistent
+  with the relations.
 
 FTS rowids are taken from the canonical page rowid and every log entry carries
 that rowid, making updates/deletes O(index lookup) rather than rescanning the
@@ -235,4 +318,9 @@ pytest -q
 
 The tests exercise exact vs folded search, a rebuild that finishes with a
 correction and a deletion submitted during the scan, duplicate job idempotency,
-and restart/stale-job recovery. They use temporary SQLite files.
+and restart/stale-job recovery. The duplicate-scan tests cover grouping,
+threshold boundaries (0.75 vs 0.8), empty signatures, NFC/casefold
+normalisation, independence from the accent policy, bridge-page
+correction/deletion re-splitting, concurrent writes that must not miss links,
+rollback atomicity when the relation step fails, and backfill of pre-existing
+pages. They use temporary SQLite files.

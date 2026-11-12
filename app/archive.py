@@ -13,6 +13,17 @@ from .db import (
     quote_identifier,
     utc_now,
 )
+from .similar import (
+    MAX_WRITE_ATTEMPTS,
+    SimilarityStateChanged,
+    apply_delete_relations,
+    apply_upsert_relations,
+    assert_snapshot_current,
+    bigrams_for,
+    ensure_similarities_current,
+    plan_links,
+    read_signatures_snapshot,
+)
 
 
 def _fts_ident(generation: sqlite3.Row) -> str:
@@ -20,9 +31,46 @@ def _fts_ident(generation: sqlite3.Row) -> str:
 
 
 def upsert_page(page_id: str, title: str, body: str) -> dict[str, Any]:
+    """Insert/replace a page and refresh its duplicate-scan relations.
+
+    The similarity plan is computed from a read-only snapshot *before* the
+    write transaction starts, so the database write lock is never held while
+    scores are computed.  The write transaction re-checks the change-log
+    high-water mark first; if a concurrent writer committed in between, the
+    transaction is rolled back and retried against a fresh snapshot, so
+    simultaneously added similar pages cannot miss their link.  Page body,
+    change log, live FTS index and similarity relations commit in the same
+    transaction — or, on any failure, not at all.
+    """
+
+    new_bigrams = bigrams_for(body)
+    ensure_similarities_current()
+    for _attempt in range(MAX_WRITE_ATTEMPTS):
+        snapshot_seq, signatures = read_signatures_snapshot()
+        links = plan_links(page_id, new_bigrams, signatures)
+        try:
+            return _commit_upsert(page_id, title, body, new_bigrams, links, snapshot_seq)
+        except SimilarityStateChanged:
+            continue  # a concurrent write moved the log; replan and retry
+    raise sqlite3.OperationalError(
+        "page upsert could not be reconciled with concurrent writes"
+    )
+
+
+def _commit_upsert(
+    page_id: str,
+    title: str,
+    body: str,
+    new_bigrams: frozenset,
+    links: list[dict[str, Any]],
+    planned_seq: int,
+) -> dict[str, Any]:
     conn = connect()
     try:
         begin_immediate(conn)
+        # Under the write lock, before any write: the plan is only valid for
+        # exactly this committed state.
+        assert_snapshot_current(conn, planned_seq)
         generation = active_index(conn)
         policy = str(generation["policy"])
         now = utc_now()
@@ -86,6 +134,9 @@ def upsert_page(page_id: str, title: str, body: str) -> dict[str, Any]:
                 normalize_for_policy(body, policy),
             ),
         )
+        apply_upsert_relations(
+            conn, page_id=page_id, rev=seq, bigrams=new_bigrams, links=links
+        )
         conn.commit()
         return {
             "page_id": page_id,
@@ -103,6 +154,10 @@ def upsert_page(page_id: str, title: str, body: str) -> dict[str, Any]:
 
 
 def delete_page(page_id: str) -> dict[str, Any]:
+    # Keep the "relations are current at the change-log high-water mark"
+    # invariant: this write advances the log, so any pending backfill for
+    # pre-existing pages must complete first (a cheap no-op when current).
+    ensure_similarities_current()
     conn = connect()
     try:
         begin_immediate(conn)
@@ -148,6 +203,7 @@ def delete_page(page_id: str) -> dict[str, Any]:
             # up any pre-existing orphan from an older schema version.
             conn.execute(f"DELETE FROM {ident} WHERE page_id = ?", (page_id,))
 
+        apply_delete_relations(conn, page_id=page_id, seq=seq)
         conn.commit()
         return {
             "page_id": page_id,

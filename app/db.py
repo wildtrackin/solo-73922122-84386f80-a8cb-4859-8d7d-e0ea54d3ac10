@@ -84,6 +84,28 @@ CREATE TABLE IF NOT EXISTS rebuild_jobs (
 CREATE UNIQUE INDEX IF NOT EXISTS ux_rebuild_one_active
 ON rebuild_jobs((1))
 WHERE state IN ('queued', 'building', 'catching_up', 'activating');
+
+-- Duplicate-scan detection (fixed rule, independent of the accent policy).
+-- One signature row per committed page, maintained in the same transaction
+-- as the page write/delete, the change-log entry and the live FTS update.
+CREATE TABLE IF NOT EXISTS page_signatures (
+    page_id TEXT PRIMARY KEY,
+    rev INTEGER NOT NULL,
+    bigram_count INTEGER NOT NULL,
+    bigrams TEXT NOT NULL
+);
+
+-- Undirected similar pairs, stored once with page_a < page_b.
+CREATE TABLE IF NOT EXISTS similar_pairs (
+    page_a TEXT NOT NULL,
+    page_b TEXT NOT NULL,
+    score REAL NOT NULL,
+    rev_a INTEGER NOT NULL,
+    rev_b INTEGER NOT NULL,
+    PRIMARY KEY (page_a, page_b)
+);
+
+CREATE INDEX IF NOT EXISTS ix_similar_pairs_b ON similar_pairs(page_b);
 """
 
 

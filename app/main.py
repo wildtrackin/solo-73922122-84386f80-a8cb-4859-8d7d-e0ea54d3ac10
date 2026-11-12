@@ -17,6 +17,7 @@ from .archive import delete_page, get_page, search, upsert_page
 from .config import SETTINGS
 from .db import claim_rebuild, connect, fail_job, get_job, get_status, init_db
 from .rebuild import cancel_local_rebuilds, start_rebuild_thread
+from .similar import duplicate_groups, ensure_similarities_current
 
 
 logging.basicConfig(
@@ -84,6 +85,54 @@ demo aid and defaults to zero.
 | señor | señor | senor or señor |
 | naïve | naïve | naive or naïve |
 | résumé | résumé | resume or résumé |
+
+### Duplicate-scan groups for QA
+
+`GET /api/duplicates` groups pages that look like the same sheet scanned
+twice. The rule is **fixed** and never follows the search accent policy: the
+body is NFC-normalised and casefolded, split into runs of Unicode
+letters/digits, and converted to the de-duplicated set of adjacent word
+pairs (bigrams). Two non-empty bigram sets are linked when
+`|A ∩ B| / |A ∪ B| ≥ 0.8`. The response lists the connected groups
+(≥ 2 pages), every similar pair and the current revision of each page.
+Nothing is merged or deleted automatically — cleanup stays a human decision.
+
+Relations are stored in SQLite and commit in the same transaction as the
+page body, change log and live FTS index (any failure rolls everything
+back). Similarity itself is computed without holding the database write
+lock, and the write is retried against a fresh snapshot if a concurrent
+writer commits in between — so simultaneously added similar pages cannot
+miss their link. Correcting or deleting a *bridge* page re-splits the
+groups on the next read. Pages that existed before this feature are
+backfilled at startup.
+
+Try it (a bridge page connects two otherwise-dissimilar pages):
+
+1. `PUT /api/pages/page-a` with body
+   `alpha bravo charlie delta echo foxtrot golf hotel india juliett`
+2. `PUT /api/pages/page-b` with body
+   `bravo charlie delta echo foxtrot golf hotel india juliett kilo`
+3. `PUT /api/pages/page-c` with body
+   `charlie delta echo foxtrot golf hotel india juliett kilo lima`
+4. `GET /api/duplicates` → one group `[page-a, page-b, page-c]`; pairs
+   `(page-a, page-b)` and `(page-b, page-c)` score `0.8`, while
+   `(page-a, page-c)` is below threshold but connected through the bridge.
+5. `DELETE /api/pages/page-b` → the next `GET /api/duplicates` shows no
+   group and no pairs: the bridge is gone and the group splits.
+
+Concurrent writers stay consistent. Fire similar writes in parallel and
+every adjacent pair still shows up:
+
+```bash
+for i in 0 1 2 3 4 5 6 7; do
+  body=""
+  for j in $(seq $i $((i+9))); do body="$body w$(printf %02d $j)"; done
+  curl -sS -X PUT "$BASE/api/pages/scan-$i" \
+    -H 'Content-Type: application/json' \
+    -d "{\"title\": \"Scan $i\", \"body\": \"$body\"}" &
+done; wait
+curl -sS "$BASE/api/duplicates"
+```
 """
 
 
@@ -109,6 +158,16 @@ class PageUpsert(BaseModel):
                         "body": (
                             "Le café fermé est près de la gare. Le señor relit "
                             "le résumé corrigé; l'élève est déjà parti."
+                        ),
+                    },
+                },
+                {
+                    "summary": "Duplicate rescan of another page (QA grouping)",
+                    "value": {
+                        "title": "Crème brûlée à Paris (rescan)",
+                        "body": (
+                            "Le café est près de la gare. Le señor lit un naïve "
+                            "résumé sous la pluie fine."
                         ),
                     },
                 },
@@ -153,6 +212,13 @@ class RebuildRequest(BaseModel):
 async def lifespan(_app: FastAPI):
     init_db()
     logger.info("database ready at startup")
+    try:
+        if ensure_similarities_current():
+            logger.info("similarity relations backfilled for pre-existing pages")
+    except Exception:
+        # Never block startup: page writes and the duplicates endpoint
+        # re-run the backfill lazily.
+        logger.exception("similarity backfill at startup failed; will retry lazily")
     yield
     cancel_local_rebuilds()
 
@@ -168,6 +234,10 @@ app = FastAPI(
         {
             "name": "index",
             "description": "Background generation rebuild and atomic accent-policy switch.",
+        },
+        {
+            "name": "duplicates",
+            "description": "Fixed-rule duplicate-scan grouping for QA review.",
         },
         {"name": "ops", "description": "Health and documentation helpers."},
     ],
@@ -462,6 +532,24 @@ def switch_alias(
     policy: Annotated[AccentPolicy | None, Query()] = None,
 ) -> dict:
     return _trigger_rebuild(request, accent_policy, policy)
+
+
+@app.get(
+    "/api/duplicates",
+    tags=["duplicates"],
+    summary="Group duplicate-scan pages by fixed body-similarity rules",
+    response_description=(
+        "Connected groups of at least two pages, every similar pair and the "
+        "current revision of each page — all read from one committed SQLite "
+        "snapshot. Pages are never merged or deleted by this API."
+    ),
+)
+def list_duplicates() -> dict:
+    try:
+        return duplicate_groups()
+    except Exception:
+        logger.exception("duplicate grouping failed")
+        raise
 
 
 @app.get(
